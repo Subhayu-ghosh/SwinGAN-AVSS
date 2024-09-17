@@ -348,75 +348,297 @@
         return out
 
 
-    class PreNorm(nn.Module):
-        def __init__(self, dim, fn):
-            super().__init__()
-            self.norm = nn.LayerNorm(dim)
-            self.fn = fn
-        def forward(self, x, **kwargs):
-            return self.fn(self.norm(x), **kwargs)
+    # class PreNorm(nn.Module):
+    #     def __init__(self, dim, fn):
+    #         super().__init__()
+    #         self.norm = nn.LayerNorm(dim)
+    #         self.fn = fn
+    #     def forward(self, x, **kwargs):
+    #         return self.fn(self.norm(x), **kwargs)
 
-    class FeedForward(nn.Module):
-        def __init__(self, dim, hidden_dim, dropout = 0.):
-            super().__init__()
-            self.net = nn.Sequential(
-                nn.Linear(dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, dim),
-                nn.Dropout(dropout)
+    # class FeedForward(nn.Module):
+    #     def __init__(self, dim, hidden_dim, dropout = 0.):
+    #         super().__init__()
+    #         self.net = nn.Sequential(
+    #             nn.Linear(dim, hidden_dim),
+    #             nn.GELU(),
+    #             nn.Dropout(dropout),
+    #             nn.Linear(hidden_dim, dim),
+    #             nn.Dropout(dropout)
+    #         )
+    #     def forward(self, x):
+    #         return self.net(x)
+
+    # class Attention(nn.Module):
+    #     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
+    #         super().__init__()
+    #         inner_dim = dim_head *  heads
+    #         project_out = not (heads == 1 and dim_head == dim)
+
+    #         self.heads = heads
+    #         self.scale = dim_head ** -0.5
+
+    #         self.attend = nn.Softmax(dim = -1)
+    #         self.dropout = nn.Dropout(dropout)
+
+    #         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
+
+    #         self.to_out = nn.Sequential(
+    #             nn.Linear(inner_dim, dim),
+    #             nn.Dropout(dropout)
+    #         ) if project_out else nn.Identity()
+
+    #     def forward(self, x):
+    #         qkv = self.to_qkv(x).chunk(3, dim = -1)
+    #         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+
+    #         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+
+    #         attn = self.attend(dots)
+    #         attn = self.dropout(attn)
+
+    #         out = torch.matmul(attn, v)
+    #         out = rearrange(out, 'b h n d -> b n (h d)')
+    #         return self.to_out(out)
+
+    # class Transformer(nn.Module):
+    #     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+    #         super().__init__()
+    #         self.layers = nn.ModuleList([])
+    #         for _ in range(depth):
+    #             self.layers.append(nn.ModuleList([
+    #                 PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+    #                 PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+    #             ]))
+    #     def forward(self, x):
+    #         for attn, ff in self.layers:
+    #             x = attn(x) + x
+    #             x = ff(x) + x
+    #         return x
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+    def forward(self, x, **kwargs):
+        return self.fn(self.norm(x), **kwargs)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout = 0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+from __future__ import annotations
+
+import itertools
+from collections.abc import Sequence
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from torch.nn import LayerNorm
+from typing_extensions import Final
+
+from monai.networks.blocks import MLPBlock as Mlp
+from monai.networks.blocks import PatchEmbed, UnetOutBlock, UnetrBasicBlock, UnetrUpBlock
+from monai.networks.layers import DropPath, trunc_normal_
+from monai.utils import ensure_tuple_rep, look_up_option, optional_import
+from monai.utils.deprecate_utils import deprecated_arg
+
+def window_reverse(windows, window_size, dims):
+    """window reverse operation based on: "Liu et al.,
+    Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
+    <https://arxiv.org/abs/2103.14030>"
+    https://github.com/microsoft/Swin-Transformer
+
+     Args:
+        windows: windows tensor.
+        window_size: local window size.
+        dims: dimension values.
+    """
+    if len(dims) == 4:
+        b, d, h, w = dims
+        x = windows.view(
+            b,
+            d // window_size[0],
+            h // window_size[1],
+            w // window_size[2],
+            window_size[0],
+            window_size[1],
+            window_size[2],
+            -1,
+        )
+        x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(b, d, h, w, -1)
+
+    elif len(dims) == 3:
+        b, h, w = dims
+        x = windows.view(b, h // window_size[0], w // window_size[1], window_size[0], window_size[1], -1)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(b, h, w, -1)
+    return x
+
+
+def get_window_size(x_size, window_size, shift_size=None):
+    """Computing window size based on: "Liu et al.,
+    Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
+    <https://arxiv.org/abs/2103.14030>"
+    https://github.com/microsoft/Swin-Transformer
+
+     Args:
+        x_size: input size.
+        window_size: local window size.
+        shift_size: window shifting size.
+    """
+
+    use_window_size = list(window_size)
+    if shift_size is not None:
+        use_shift_size = list(shift_size)
+    for i in range(len(x_size)):
+        if x_size[i] <= window_size[i]:
+            use_window_size[i] = x_size[i]
+            if shift_size is not None:
+                use_shift_size[i] = 0
+
+    if shift_size is None:
+        return tuple(use_window_size)
+    else:
+        return tuple(use_window_size), tuple(use_shift_size)
+
+
+class WindowAttention(nn.Module):
+    """
+    Window based multi-head self attention module with relative position bias based on: "Liu et al.,
+    Swin Transformer: Hierarchical Vision Transformer using Shifted Windows
+    <https://arxiv.org/abs/2103.14030>"
+    https://github.com/microsoft/Swin-Transformer
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size: Sequence[int],
+        qkv_bias: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        """
+        Args:
+            dim: number of feature channels.
+            num_heads: number of attention heads.
+            window_size: local window size.
+            qkv_bias: add a learnable bias to query, key, value.
+            attn_drop: attention dropout rate.
+            proj_drop: dropout rate of output.
+        """
+
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim**-0.5
+        mesh_args = torch.meshgrid.__kwdefaults__
+
+        if len(self.window_size) == 3:
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros(
+                    (2 * self.window_size[0] - 1) * (2 * self.window_size[1] - 1) * (2 * self.window_size[2] - 1),
+                    num_heads,
+                )
             )
-        def forward(self, x):
-            return self.net(x)
+            coords_d = torch.arange(self.window_size[0])
+            coords_h = torch.arange(self.window_size[1])
+            coords_w = torch.arange(self.window_size[2])
+            if mesh_args is not None:
+                coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w, indexing="ij"))
+            else:
+                coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w))
+            coords_flatten = torch.flatten(coords, 1)
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+            relative_coords[:, :, 0] += self.window_size[0] - 1
+            relative_coords[:, :, 1] += self.window_size[1] - 1
+            relative_coords[:, :, 2] += self.window_size[2] - 1
+            relative_coords[:, :, 0] *= (2 * self.window_size[1] - 1) * (2 * self.window_size[2] - 1)
+            relative_coords[:, :, 1] *= 2 * self.window_size[2] - 1
+        elif len(self.window_size) == 2:
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+            )
+            coords_h = torch.arange(self.window_size[0])
+            coords_w = torch.arange(self.window_size[1])
+            if mesh_args is not None:
+                coords = torch.stack(torch.meshgrid(coords_h, coords_w, indexing="ij"))
+            else:
+                coords = torch.stack(torch.meshgrid(coords_h, coords_w))
+            coords_flatten = torch.flatten(coords, 1)
+            relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+            relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+            relative_coords[:, :, 0] += self.window_size[0] - 1
+            relative_coords[:, :, 1] += self.window_size[1] - 1
+            relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
 
-    class Attention(nn.Module):
-        def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
-            super().__init__()
-            inner_dim = dim_head *  heads
-            project_out = not (heads == 1 and dim_head == dim)
+        relative_position_index = relative_coords.sum(-1)
+        self.register_buffer("relative_position_index", relative_position_index)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        self.softmax = nn.Softmax(dim=-1)
 
-            self.heads = heads
-            self.scale = dim_head ** -0.5
+    def forward(self, x, mask):
+        b, n, c = x.shape
+        qkv = self.qkv(x).reshape(b, n, 3, self.num_heads, c // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = q * self.scale
+        attn = q @ k.transpose(-2, -1)
+        relative_position_bias = self.relative_position_bias_table[
+            self.relative_position_index.clone()[:n, :n].reshape(-1)
+        ].reshape(n, n, -1)
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+        attn = attn + relative_position_bias.unsqueeze(0)
+        if mask is not None:
+            nw = mask.shape[0]
+            attn = attn.view(b // nw, nw, self.num_heads, n, n) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, n, n)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
 
-            self.attend = nn.Softmax(dim = -1)
-            self.dropout = nn.Dropout(dropout)
+        attn = self.attn_drop(attn).to(v.dtype)
+        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+    
+class Transformer(nn.Module):
+    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
+                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+            ]))
+    def forward(self, x):
+        for attn, ff in self.layers:
+            x = attn(x) + x
+            x = ff(x) + x
+        return x
 
-            self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-
-            self.to_out = nn.Sequential(
-                nn.Linear(inner_dim, dim),
-                nn.Dropout(dropout)
-            ) if project_out else nn.Identity()
-
-        def forward(self, x):
-            qkv = self.to_qkv(x).chunk(3, dim = -1)
-            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-            dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-
-            attn = self.attend(dots)
-            attn = self.dropout(attn)
-
-            out = torch.matmul(attn, v)
-            out = rearrange(out, 'b h n d -> b n (h d)')
-            return self.to_out(out)
-
-    class Transformer(nn.Module):
-        def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
-            super().__init__()
-            self.layers = nn.ModuleList([])
-            for _ in range(depth):
-                self.layers.append(nn.ModuleList([
-                    PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                    PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
-                ]))
-        def forward(self, x):
-            for attn, ff in self.layers:
-                x = attn(x) + x
-                x = ff(x) + x
-            return x
-
-    class PatchDiscriminator(nn.Module):
+class PatchDiscriminator(nn.Module):
         def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
             super().__init__()
             image_height, image_width = pair(image_size)
@@ -428,42 +650,66 @@
             patch_dim = channels * patch_height * patch_width
             assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-            self.to_patch_embedding = nn.Sequential(
-                Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
-                nn.LayerNorm(patch_dim),
-                nn.Linear(patch_dim, dim),
-                nn.LayerNorm(dim),
-            )
 
-            self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-            self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-            self.dropout = nn.Dropout(emb_dropout)
-
-            self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
-
-            self.pool = pool
-            self.to_latent = nn.Identity()
-
-            self.mlp_head = nn.Sequential(
-                nn.LayerNorm(dim),
-                nn.Linear(dim, num_classes)
+            self.Transformer = Transformer()  # Input size depends on the data
+            self.WindowAttention = WindowAttention()
+            self.sigmoid = nn.Sigmoid()
             )
 
         def forward(self, img):
-            x = self.to_patch_embedding(img)
-            b, n, _ = x.shape
+            x = self.Transformer(x)
+            x = self.WindowAttention(x)
+            x = self.sigmoid(self.fc4(x))
+            return x
 
-            cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-            x = torch.cat((cls_tokens, x), dim=1)
-            x += self.pos_embedding[:, :(n + 1)]
-            x = self.dropout(x)
+    # class PatchDiscriminator(nn.Module):
+    #     def __init__(self, *, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, pool = 'cls', channels = 3, dim_head = 64, dropout = 0., emb_dropout = 0.):
+    #         super().__init__()
+    #         image_height, image_width = pair(image_size)
+    #         patch_height, patch_width = pair(patch_size)
 
-            x = self.transformer(x)
+    #         assert image_height % patch_height == 0 and image_width % patch_width == 0, 'Image dimensions must be divisible by the patch size.'
 
-            x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+    #         num_patches = (image_height // patch_height) * (image_width // patch_width)
+    #         patch_dim = channels * patch_height * patch_width
+    #         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
-            x = self.to_latent(x)
-            return self.mlp_head(x)
+    #         self.to_patch_embedding = nn.Sequential(
+    #             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
+    #             nn.LayerNorm(patch_dim),
+    #             nn.Linear(patch_dim, dim),
+    #             nn.LayerNorm(dim),
+    #         )
+
+    #         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+    #         self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+    #         self.dropout = nn.Dropout(emb_dropout)
+
+    #         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+    #         self.pool = pool
+    #         self.to_latent = nn.Identity()
+
+    #         self.mlp_head = nn.Sequential(
+    #             nn.LayerNorm(dim),
+    #             nn.Linear(dim, num_classes)
+    #         )
+
+        # def forward(self, img):
+        #     x = self.to_patch_embedding(img)
+        #     b, n, _ = x.shape
+
+        #     cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
+        #     x = torch.cat((cls_tokens, x), dim=1)
+        #     x += self.pos_embedding[:, :(n + 1)]
+        #     x = self.dropout(x)
+
+        #     x = self.transformer(x)
+
+        #     x = x.mean(dim = 1) if self.pool == 'mean' else x[:, 0]
+
+        #     x = self.to_latent(x)
+        #     return self.mlp_head(x)
     #class PatchDiscriminator(nn.Module):
         #def __init__(self, n_class=33, ns=0.2, dp=0.1):
             #super(PatchDiscriminator, self).__init__()
