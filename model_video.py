@@ -498,6 +498,31 @@ class VideoEncoder(nn.Module):
         x = self.to_latent(x)
         return self.mlp_head(x)
 
+
+import torch
+import torch.nn.functional as F
+
+# Temporal Coherence Loss
+def temporal_coherence_loss(generator, Y, t):
+    """
+    Args:
+        generator: The AVS generator model.
+        X_tgt: Input feature at time t.
+        t: Current time step.
+
+    Returns:
+        Temporal coherence loss between frame t and t-1.
+    """
+    # Generate outputs at time t and t-1
+    G_t = generator(Y, t)     # Output at time t
+    G_t_prev = generator(Y, t-1) # Output at time t-1
+
+    # Compute the L1 loss (difference) between consecutive outputs
+    loss_tc = F.l1_loss(G_t, G_t_prev)
+
+    return loss_tc
+
+
 #class VideoEncoder(nn.Module):
  #   def __init__(self):
   #      super(VideoEncoder, self).__init__()
