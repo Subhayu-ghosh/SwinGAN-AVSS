@@ -1037,6 +1037,34 @@ class PatchDiscriminator(nn.Module):
                 return loss_recon, loss_recon0, loss_content, Loss
             return loss_dict, loss_dict_discriminator, loss_dict_wavenet
 
+
+
+    # Feature Matching Loss
+    def feature_matching_loss(discriminator, real_audio, fake_audio):
+        """
+        Args:
+            discriminator: The VC discriminator model.
+            real_audio: The ground truth target audio.
+            fake_audio: The generated audio from the VC model.
+    
+        Returns:
+            Feature matching loss between the real and generated audio.
+        """
+        # Get the discriminator feature maps for real and fake audio
+        real_features = discriminator(real_audio)
+        fake_features = discriminator(fake_audio)
+    
+        # Initialize loss
+        loss_fm = 0
+    
+        # Sum the L1 loss across all layers
+        for real_feature, fake_feature in zip(real_features, fake_features):
+            loss_fm += F.l1_loss(fake_feature, real_feature)
+    
+        return loss_fm
+
+
+
     class VideoAudioGenerator(nn.Module):
         def __init__(self, dim_neck, dim_emb, dim_pre, freq, dim_spec=80, is_train=False, lr=0.001,
                     multigpu=False, 
