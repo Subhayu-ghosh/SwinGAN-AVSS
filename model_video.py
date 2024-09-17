@@ -499,8 +499,6 @@ class VideoEncoder(nn.Module):
         return self.mlp_head(x)
 
 
-import torch
-import torch.nn.functional as F
 
 # Temporal Coherence Loss
 def temporal_coherence_loss(generator, Y, t):
