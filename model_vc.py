@@ -15,7 +15,6 @@
     from model_video import VideoGenerator, STAGE2_G
     from audioUtils import audio
     from vocoder.models.fatchord_version import WaveRNN
-    from kan_convs import KANConv1DLayer
 
 
     _inv_mel_basis = np.linalg.pinv(audio._build_mel_basis(hparams))
